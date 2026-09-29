@@ -7,7 +7,7 @@ from typing import TypeVar
 from langchain.chat_models import BaseChatModel
 from pydantic import BaseModel
 
-from .base import BaseMerger
+from .base import BaseMerger, KeyExtractionError
 from .classic_merger.keep_existing import KeepExistingMerger
 from .classic_merger.keep_incoming import KeepIncomingMerger
 from .classic_merger.merge_field import FieldMerger
@@ -186,6 +186,7 @@ __all__ = [
     "BalancedMerger",
     "BaseLLMMerger",
     "BaseMerger",
+    "KeyExtractionError",
     "CustomRuleMerger",
     "FieldMerger",
     "KeepExistingMerger",

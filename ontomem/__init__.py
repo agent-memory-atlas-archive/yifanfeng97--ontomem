@@ -6,6 +6,7 @@ with automatic deduplication, merging, and vector-based search.
 
 from .core.base import BaseMem
 from .core.omem import OMem
+from .merger import KeyExtractionError
 from .merger import (
     BalancedMerger,
     BaseLLMMerger,
@@ -25,6 +26,7 @@ __email__ = "evanfeng97@gmail.com"
 
 __all__ = [
     # Main API
+    "KeyExtractionError",
     "OMem",
     # Core interfaces
     "BaseMem",

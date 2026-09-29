@@ -20,7 +20,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 
-from ..merger import BaseMerger, MergeStrategy, create_merger
+from ..merger import BaseMerger, FieldMerger, MergeStrategy, create_merger
 from ..utils.logging import configure_logging, get_logger
 from .base import BaseMem, T
 from .sources import SourceRecord
@@ -875,16 +875,32 @@ class OMem(BaseMem[T], Generic[T]):
                     out.append(item)
         return out
 
-    def _rollback_source(self, source_id: str, *, strategy: str) -> dict[str, Any]:
+    #: Above this many surviving raw items for one key, exact-rollback
+    #: re-merges fall back to the deterministic field merge ("auto" mode).
+    #: Giant LLM re-merge prompts make smaller models loop for minutes and
+    #: the caller waits with no timeout.
+    mechanical_remerge_threshold = 12
+
+    def _rollback_source(
+        self,
+        source_id: str,
+        *,
+        strategy: str,
+        remerge: str = "auto",
+    ) -> dict[str, Any]:
         """Roll back one source's contributions. Pops the ledger record.
 
         Returns:
             Report dict with ``removed_keys`` (keys deleted outright) and
             ``remerged_keys`` (keys re-merged from surviving sources).
         """
+        if remerge not in ("auto", "llm", "mechanical"):
+            raise ValueError(f"Unknown remerge mode: {remerge!r}")
+
         record = self._sources.pop(source_id)
         raw_items = [self.memory_schema.model_validate(raw) for raw in record.raw_items]
         affected_keys = {self.key_extractor(item) for item in raw_items}
+        mechanical_merger: BaseMerger | None = None
 
         touched = strategy == "touched"
         removed_keys: list[Any] = []
@@ -905,7 +921,23 @@ class OMem(BaseMem[T], Generic[T]):
                 # Exact-ish rollback: re-merge the surviving sources' raw
                 # results. Deterministic for classic strategies; approximate
                 # wording for LLM strategies.
-                merged_list = self._merger.merge([current] + survivors)
+                #
+                # "auto": small survivor sets use the configured (LLM)
+                # merger; large sets fall back to the deterministic field
+                # merge — an unbounded LLM re-merge prompt makes smaller
+                # models loop for minutes while the caller waits.
+                if remerge == "mechanical" or (
+                    remerge == "auto"
+                    and len(survivors) > self.mechanical_remerge_threshold
+                ):
+                    if mechanical_merger is None:
+                        mechanical_merger = FieldMerger(
+                            key_extractor=self.key_extractor
+                        )
+                    merger = mechanical_merger
+                else:
+                    merger = self._merger
+                merged_list = merger.merge([current] + survivors)
                 merged = next(
                     (m for m in merged_list if self.key_extractor(m) == key), None
                 )
@@ -934,7 +966,11 @@ class OMem(BaseMem[T], Generic[T]):
         }
 
     def remove_source(
-        self, source_id: str, *, strategy: str = "exact"
+        self,
+        source_id: str,
+        *,
+        strategy: str = "exact",
+        remerge: str = "auto",
     ) -> dict[str, Any]:
         """Remove every contribution of one source document.
 
@@ -958,7 +994,9 @@ class OMem(BaseMem[T], Generic[T]):
             raise ValueError(f"Unknown strategy: {strategy!r}")
 
         with self.suspended_index():
-            report = self._rollback_source(source_id, strategy=strategy)
+            report = self._rollback_source(
+                source_id, strategy=strategy, remerge=remerge
+            )
 
         index_patched = self.sync_index(
             removed_keys=set(report["removed_keys"]),
@@ -1011,6 +1049,7 @@ class OMem(BaseMem[T], Generic[T]):
         *,
         content_hash: str | None = None,
         strategy: str = "exact",
+        remerge: str = "auto",
     ) -> dict[str, Any]:
         """Replace one source document: roll back the old version, merge the new.
 
@@ -1051,7 +1090,9 @@ class OMem(BaseMem[T], Generic[T]):
 
         with self.suspended_index():
             if source_id in self._sources:
-                rollback = self._rollback_source(source_id, strategy=strategy)
+                rollback = self._rollback_source(
+                    source_id, strategy=strategy, remerge=remerge
+                )
                 report["removed_keys"] = rollback["removed_keys"]
                 report["remerged_keys"] = rollback["remerged_keys"]
 

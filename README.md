@@ -36,6 +36,11 @@ It excels at **Time-Series Consolidation**: effortlessly merging streaming obser
 <details>
 <summary>Details</summary>
 
+- **[2026-09-29] 🔒 v0.6.1: Safe Merging — KeyExtractionError, Warning Aggregation & Mechanical Re-merge**:
+  - **`KeyExtractionError`**: when every item fails key extraction (typically a key-extractor vs schema mismatch), `merge()` now raises an aggregate error naming the failure count and first cause — instead of silently returning an empty result
+  - **Aggregated warnings**: `key_extraction_failed` logs one line per distinct error with a count (`x118`), not one line per item
+  - **Mechanical re-merge**: `remove_source()`/`upsert_source()` accept `remerge="mechanical" | "auto" | "llm"` — exact rollbacks on large shared keys fall back to the deterministic field merge (seconds, no LLM) instead of unbounded LLM merge calls
+  - **Bounded batches**: tournament merge caps pairs per `batch_merge()` call (default 40) so prompts cannot grow without bound
 - **[2026-09-04] 🎉 v0.6.0: Source Tags & Scoped Search**:
   - **`tag_source()` / `source_tags()`**: tag documents in the ledger (persisted with dump_sources)
   - **Scoped search**: `search(query, source_ids=[...], tags=[...])` — retrieve only within a subset of documents, with automatic over-fetch

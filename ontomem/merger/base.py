@@ -19,6 +19,15 @@ T = TypeVar("T", bound=BaseModel)
 logger = get_logger(__name__)
 
 
+class KeyExtractionError(Exception):
+    """Raised when none of the items yield a valid key during merge.
+
+    Typically caused by a template/config mismatch: the key extractor
+    references fields the items do not carry. The aggregate message names
+    the failure count, the distinct errors, and the first item preview.
+    """
+
+
 class BaseMerger(ABC, Generic[T]):
     """Abstract base class for item mergers with tournament-style merge algorithm.
 
@@ -78,6 +87,10 @@ class BaseMerger(ABC, Generic[T]):
         """
         self.key_extractor = key_extractor
         self.logger = logger_instance or logger
+        #: Maximum pairs per batch_merge() call. Larger merge jobs are split
+        #: into sequential calls so a single prompt cannot grow without
+        #: bound (giant prompts make smaller models loop for minutes).
+        self.max_batch_pairs = 40
 
     # ==================== Abstract Methods ====================
 
@@ -191,15 +204,45 @@ class BaseMerger(ABC, Generic[T]):
         from collections import defaultdict
 
         groups = defaultdict(list)
+        failures: dict[str, int] = {}
+        first_error = ""
+        none_key_count = 0
         for item in items:
             try:
                 key = self.key_extractor(item)
                 if key is not None:
                     groups[key].append(item)
                 else:
-                    self.logger.warning("item_has_none_key", item=str(item))
+                    none_key_count += 1
             except Exception as e:
-                self.logger.warning("key_extraction_failed", error=str(e))
+                msg = str(e)
+                failures[msg] = failures.get(msg, 0) + 1
+                if not first_error:
+                    first_error = msg
+
+        # Aggregated warning: one line per distinct error instead of one
+        # line per failing item (a config-level error otherwise floods the
+        # log and buries the root cause).
+        for msg, count in failures.items():
+            self.logger.warning(
+                "key_extraction_failed", count=count, error=msg
+            )
+        if none_key_count:
+            self.logger.warning("item_has_none_key", count=none_key_count)
+
+        # Every item failed to produce a key: the caller's key extractor is
+        # incompatible with these items (typically a config error). Failing
+        # loudly here beats an empty merge result downstream.
+        if items and not groups:
+            distinct = "; ".join(f"{msg!r} x{c}" for msg, c in failures.items())
+            raise KeyExtractionError(
+                f"key extraction failed for all {len(items)} item(s); "
+                f"check key_extractor against the item fields "
+                f"[{distinct or 'all keys were None'}]; "
+                f"first item: {str(items[0])[:120]}"
+            ) from (
+                Exception(first_error) if first_error else None
+            )
         return dict(groups)
 
     def _cross_key_tournament_merge(self, groups: dict[Any, list[T]]) -> list[T]:
@@ -254,10 +297,16 @@ class BaseMerger(ABC, Generic[T]):
             key: items[:] for key, items in groups.items()
         }
 
+        if not groups:
+            return []
+
         round_num = 0
         max_rounds = max(
-            math.ceil(math.log2(len(items))) if len(items) > 1 else 0
-            for items in groups.values()
+            (
+                math.ceil(math.log2(len(items))) if len(items) > 1 else 0
+                for items in groups.values()
+            ),
+            default=0,
         )
 
         self.logger.debug(
@@ -282,7 +331,8 @@ class BaseMerger(ABC, Generic[T]):
                     all_pairs.append((current_items[i], current_items[i + 1]))
                     pair_to_key.append(key)
 
-            # Batch merge ALL pairs from ALL keys in ONE call
+            # Batch merge pairs from ALL keys, split into capped calls so a
+            # single prompt stays bounded.
             if all_pairs:
                 self.logger.debug(
                     "tournament_round",
@@ -292,7 +342,14 @@ class BaseMerger(ABC, Generic[T]):
                     keys=len([k for k, items in key_rounds.items() if len(items) > 1]),
                 )
 
-                merged_results = self.batch_merge(all_pairs)
+                merged_results = []
+                cap = max(1, int(getattr(self, "max_batch_pairs", 40)))
+                for chunk_start in range(0, len(all_pairs), cap):
+                    merged_results.extend(
+                        self.batch_merge(
+                            all_pairs[chunk_start : chunk_start + cap]
+                        )
+                    )
 
                 # Distribute results back to keys
                 result_idx = 0
